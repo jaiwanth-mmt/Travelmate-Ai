@@ -1,7 +1,9 @@
+import asyncio
 import os
 import certifi
 from dotenv import load_dotenv
-from urllib3 import response
+import nest_asyncio
+nest_asyncio.apply()
 
 
 load_dotenv()
@@ -25,8 +27,9 @@ from langchain.messages import (
     SystemMessage
 )
 from langchain_groq import ChatGroq
-from tools.tavily_tool import tavily_search
-from tools.flight_tool import search_flights
+from mcp_client import tavily_mcp_search , aviation_mcp_call , extract_destination, forecast_mcp_search,forecast_tool, weather_mcp_search
+
+
 
 
 def get_database_url():
@@ -59,22 +62,95 @@ class TravelState(TypedDict):
     hotel_results: str
     itineary: str
     llm_calls: int
+    weather_results: str
 
+
+FLIGHT_AGENT_PROMPT = """
+You are a travel flight expert.
+
+User Query:
+{query}
+
+Airport Information:
+{airport_data}
+
+Airline Information:
+{airline_data}
+
+Generate:
+
+1. Likely departure airport
+2. Likely arrival airport
+3. Airlines serving this route
+4. Typical flight duration
+5. Estimated airfare range
+6. Peak season pricing warning
+7. Booking advice
+
+Return concise travel guidance.
+"""
+
+
+
+
+# Flight Agent
 def flight_agent(state: TravelState):
+    print("\nINSIDE FLIGHT AGENT\n")
+
     query = state["user_query"]
-    flight_data = search_flights(query)
+
+    try:
+
+        airports = asyncio.run(
+            aviation_mcp_call(
+                "list_airports"
+            )
+        )
+
+        airlines = asyncio.run(
+            aviation_mcp_call(
+                "list_airlines"
+            )
+        )
+
+
+        print("\nAIRPORTS:", airports)
+        print("\nAIRLINES:", airlines)
+
+        prompt = FLIGHT_AGENT_PROMPT.format(
+            query=query,
+            airport_data=str(airports)[:3000],
+            airline_data=str(airlines)[:3000]
+        )
+
+        response = llm.invoke([
+            SystemMessage(
+                content="You are an expert travel flight planner."
+            ),
+            HumanMessage(content=prompt)
+        ])
+
+        flight_data = response.content
+
+    except Exception as e:
+
+        flight_data = f"Flight information unavailable: {str(e)}"
 
     return {
-        'flight_results': flight_data,
-        "messages" : [
-            AIMessage(content="Flight results fetched")
+        "flight_results": flight_data,
+        "messages": [
+            AIMessage(
+                content="Flight recommendations generated"
+            )
         ],
-        "llm_calls" : state.get("llm_calls" , 0) + 1
+        "llm_calls": state.get("llm_calls", 0) + 1
     }
+
 
 def hotel_agent(state: TravelState):
     query = f"Best hotels for {state['user_query']}"
-    hotel_results = tavily_search(query)
+    
+    hotel_results = asyncio.run(tavily_mcp_search(query))
 
     return {
         "hotel_results" : hotel_results,
@@ -82,6 +158,30 @@ def hotel_agent(state: TravelState):
             AIMessage(content="Hotels information  fetched")
         ] ,
         "llm_calls" : state.get("llm_calls" , 0) + 1
+    }
+
+def weather_agent(state: TravelState):
+    city = extract_destination(state["user_query"])
+
+    weather_data = asyncio.run(
+        weather_mcp_search(city)
+    )
+
+    forecast_data = asyncio.run(
+        forecast_mcp_search(city)
+    )
+
+    return {
+        "weather_results" : f"""
+        Current Weather : {weather_data}
+
+        Forecast : {forecast_data}
+        """,
+        "messages":[
+            AIMessage(
+                content="Weather information fetched"
+            )
+        ]
     }
 
 def itineary_agent(state: TravelState):
@@ -96,6 +196,9 @@ def itineary_agent(state: TravelState):
 
     Hotel Results:
     {state['hotel_results']}
+
+    Weather Results:
+    {state['weather_results']}
 
     Make the itineary practical , budget aware , and easy to follow.
     """
@@ -124,6 +227,9 @@ def final_agent(state: TravelState):
 
     Hotels:
     {state['hotel_results']}
+
+    Weather:
+    {state['weather_results']}
 
     Itineary:
     {state['itineary']}
@@ -161,14 +267,16 @@ graph = StateGraph(TravelState)
 
 graph.add_node("flight_agent" , flight_agent)
 graph.add_node("hotel_agent" , hotel_agent)
+graph.add_node("weather_agent" , weather_agent)
 graph.add_node("itineary_agent" , itineary_agent)
 graph.add_node("final_agent" , final_agent)
 
-graph.add_edge(START , "flight_agent")
-graph.add_edge("flight_agent" , "hotel_agent")
-graph.add_edge("hotel_agent" , "itineary_agent")
-graph.add_edge("itineary_agent" , "final_agent")
-graph.add_edge("final_agent" , END)
+graph.add_edge(START, "flight_agent")
+graph.add_edge("flight_agent", "hotel_agent")
+graph.add_edge("hotel_agent", "weather_agent")
+graph.add_edge("weather_agent", "itineary_agent")
+graph.add_edge("itineary_agent", "final_agent")
+graph.add_edge("final_agent", END)
 
 DATABASE_URL = get_database_url()
 
@@ -201,6 +309,7 @@ def run_travel_agent(user_input: str ,  thread_id: str | None = None):
             "user_query" : user_input,
             "flight_results" : "",
             "hotel_results" : "" ,
+            "weather_results" : "" ,
             "itineary" : "",
             "llm_calls" : 0
         },
@@ -214,6 +323,7 @@ def run_travel_agent(user_input: str ,  thread_id: str | None = None):
         "answer" : final_answer,
         "flight_results" : result.get("flight_results" , ""),
         "hotel_results" : result.get("hotel_results" , ""),
+        "weather_results" : result.get("weather_results" , ""),
         "itineary" : result.get("itineary" , ""),
         "llm_calls" : result.get("llm_calls" , 0)
     }
